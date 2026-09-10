@@ -226,15 +226,19 @@ func (s *store) allow(bucket, ip string, rpm int, now time.Time) (bool, int) {
 	return s.take(bucket+"|"+ip, int64(rpm), 1, time.Minute, now)
 }
 
-// allowVolume applies the hourly create-count and upload-byte caps.
-func (s *store) allowVolume(ip string, bytes int64, now time.Time) (ok bool, retryAfter int, limit string) {
+// allowCount applies the hourly create-count cap. It is charged before the
+// body is read, so an exhausted quota costs no ingress.
+func (s *store) allowCount(ip string, now time.Time) (ok bool, retryAfter int, limit string) {
 	if ok, retry := s.take("createh|"+ip, int64(s.createPerHour), 1, time.Hour, now); !ok {
 		return false, retry, "per_hour"
 	}
-	if ok, retry := s.take("createb|"+ip, s.createBytesHour, bytes, time.Hour, now); !ok {
-		return false, retry, "bytes_per_hour"
-	}
 	return true, 0, ""
+}
+
+// allowBytes charges the hourly upload-byte cap. Only this one has to wait for
+// the body, because only it needs the real length.
+func (s *store) allowBytes(ip string, bytes int64, now time.Time) (ok bool, retryAfter int) {
+	return s.take("createb|"+ip, s.createBytesHour, bytes, time.Hour, now)
 }
 
 // alertClient is shared: alerts fire exactly when the server is busiest, so
@@ -376,6 +380,25 @@ func (s *store) janitor(ctx context.Context) {
 	}
 }
 
+// serve runs srv until ctx is cancelled, then waits for in-flight requests to
+// drain. Shutdown makes Serve return ErrServerClosed immediately, so returning
+// on that alone would exit while handlers are still writing -- and a claim is
+// tombstoned before its ciphertext is sent, so a truncated response destroys
+// the only copy.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, grace time.Duration) error {
+	drained := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
+		drained <- srv.Shutdown(sctx)
+	}()
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return <-drained
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -404,32 +427,45 @@ func (s *store) create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ip := s.clientIP(r)
+	// Both of these are cheap and unspoofable, so they run before the body is
+	// read: an IP that is already out of quota must not be able to make the
+	// server buffer 32 MiB first.
 	s.mu.Lock()
 	ok, retry := s.allow("create", ip, s.createRPM, s.now())
+	limit := "per_minute"
+	if ok {
+		ok, retry, limit = s.allowCount(ip, s.now())
+	}
 	s.mu.Unlock()
 	if !ok {
-		s.alert("rate_limited", map[string]any{"bucket": "create", "limit": "per_minute"})
-		s.record(r, "rate_limited", "per_minute")
+		event := "rate_limited"
+		if limit != "per_minute" {
+			event = "volume_limited"
+		}
+		s.alert(event, map[string]any{"bucket": "create", "limit": limit})
+		s.record(r, event, limit)
 		w.Header().Set("Retry-After", strconv.Itoa(retry))
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many requests", "retry_after_seconds": retry})
 		return
 	}
 	// Blob cap is ~20 MiB; base64 (+33%) plus JSON framing fits in 32 MiB.
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	// Charge the bytes that actually arrived, including on a truncated read --
+	// an aborted upload still consumed the ingress, so leaving it uncharged
+	// would make it a free channel. r.ContentLength is client-declared and is
+	// never what gets metered.
+	s.mu.Lock()
+	volOK, volRetry := s.allowBytes(ip, int64(len(body)), s.now())
+	s.mu.Unlock()
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "malformed body")
 		return
 	}
-	// Meter what actually arrived. r.ContentLength is client-declared: it can be
-	// negative for chunked bodies, or large enough to overflow the window.
-	s.mu.Lock()
-	ok, retry, limit := s.allowVolume(ip, int64(len(body)), s.now())
-	s.mu.Unlock()
-	if !ok {
-		s.alert("volume_limited", map[string]any{"bucket": "create", "limit": limit})
-		s.record(r, "volume_limited", limit)
-		w.Header().Set("Retry-After", strconv.Itoa(retry))
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many requests", "retry_after_seconds": retry})
+	if !volOK {
+		s.alert("volume_limited", map[string]any{"bucket": "create", "limit": "bytes_per_hour"})
+		s.record(r, "volume_limited", "bytes_per_hour")
+		w.Header().Set("Retry-After", strconv.Itoa(volRetry))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many requests", "retry_after_seconds": volRetry})
 		return
 	}
 	if json.Unmarshal(body, &req) != nil {
@@ -614,18 +650,16 @@ func main() {
 		ReadTimeout:       5 * time.Minute, // ~27 MB uploads on slow links
 		WriteTimeout:      5 * time.Minute,
 	}
-	// Drain in-flight claims: a secret is tombstoned before its ciphertext is
-	// written, so dropping that response would destroy the only copy.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// A second signal kills immediately rather than waiting out the drain.
 	go func() {
 		<-ctx.Done()
 		stop()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("graceful shutdown: %v", err)
-		}
 	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := serve(ctx, srv, ln, 30*time.Second); err != nil {
 		log.Fatal(err)
 	}
 }

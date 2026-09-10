@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -760,6 +761,146 @@ func TestGoneEvent(t *testing.T) {
 		if got := goneEvent(c.in); got != c.want {
 			t.Errorf("goneEvent(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// countingReader records how many body bytes the server actually consumed.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// truncatedReader hands over its data and then fails, like a client that
+// disconnects mid-upload.
+type truncatedReader struct{ data []byte }
+
+func (f *truncatedReader) Read(p []byte) (int, error) {
+	if len(f.data) == 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := copy(p, f.data)
+	f.data = f.data[n:]
+	return n, nil
+}
+
+// TestServeDrainsInFlightRequests: Shutdown makes Serve return ErrServerClosed
+// immediately, so serve has to wait for the drain. A claim is tombstoned before
+// its ciphertext is written, so exiting early truncates the only copy.
+func TestServeDrainsInFlightRequests(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte("complete"))
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux}
+	// Background is the deliberate parent: the test owns the cancellation.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, srv, ln, 30*time.Second) }()
+
+	bodies := make(chan string, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/slow")
+		if err != nil {
+			bodies <- "request failed: " + err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		bodies <- string(b)
+	}()
+
+	<-started
+	cancel() // the SIGTERM, arriving mid-request
+
+	select {
+	case err := <-served:
+		t.Fatalf("serve returned while a request was still in flight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if got := <-bodies; got != "complete" {
+		t.Errorf("in-flight response = %q, want %q", got, "complete")
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return once the drain finished")
+	}
+}
+
+func quotaStore(clk *fakeClock, perHour int, bytesHour int64) *store {
+	return &store{m: make(map[string]*record), maxTTL: time.Hour, now: clk.Now, allowShare: true,
+		enforce: false, createPerHour: perHour, createBytesHour: bytesHour, rl: make(map[string]*window)}
+}
+
+// TestCreateRejectsExhaustedQuotaBeforeReadingBody: an IP that is out of hourly
+// creates must be turned away without the server buffering its upload first.
+func TestCreateRejectsExhaustedQuotaBeforeReadingBody(t *testing.T) {
+	clk := &fakeClock{t: time.Now()}
+	s := quotaStore(clk, 1, 0)
+	sec := makeSecret(t)
+	payload, _ := json.Marshal(map[string]any{"id": sec.id, "ct": sec.ct, "verifier": sec.verifier, "ttl_seconds": 3600})
+
+	r1 := httptest.NewRequest("POST", "/api/secrets", bytes.NewReader(payload))
+	r1.RemoteAddr = "192.0.2.1:1234"
+	w1 := httptest.NewRecorder()
+	s.create(w1, r1)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first create: got %d, want 201", w1.Code)
+	}
+
+	counter := &countingReader{r: bytes.NewReader(payload)}
+	r2 := httptest.NewRequest("POST", "/api/secrets", counter)
+	r2.RemoteAddr = "192.0.2.1:1234"
+	w2 := httptest.NewRecorder()
+	s.create(w2, r2)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second create: got %d, want 429", w2.Code)
+	}
+	if counter.n != 0 {
+		t.Errorf("server read %d body bytes from a quota-exhausted request, want 0", counter.n)
+	}
+}
+
+// TestCreateChargesBytesOnTruncatedUpload: an aborted upload still consumed the
+// ingress, so leaving it uncharged would make it a free channel.
+func TestCreateChargesBytesOnTruncatedUpload(t *testing.T) {
+	clk := &fakeClock{t: time.Now()}
+	s := quotaStore(clk, 0, 4096)
+	r := httptest.NewRequest("POST", "/api/secrets", &truncatedReader{data: make([]byte, 512)})
+	r.RemoteAddr = "192.0.2.2:1234"
+	w := httptest.NewRecorder()
+	s.create(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("truncated upload: got %d, want 400", w.Code)
+	}
+	s.mu.Lock()
+	win := s.rl["createb|192.0.2.2"]
+	s.mu.Unlock()
+	if win == nil {
+		t.Fatal("truncated upload was never charged against the byte window")
+	}
+	if win.count != 512 {
+		t.Errorf("charged %d bytes, want 512", win.count)
 	}
 }
 
