@@ -72,6 +72,11 @@ export class Secret extends DurableObject {
 
   private async claim(request: Request): Promise<Response> {
     const { auth } = await request.json<{ auth: string }>();
+    // Hash first: this must be the LAST non-storage await in the method. Once
+    // the record is read, every step through to the writes has to stay inside
+    // one Durable Object input gate, or two concurrent claims can both act on
+    // the same stale record. auth is HEX_RE-validated by the router.
+    const sum = hex(await crypto.subtle.digest('SHA-256', hexToBytes(auth)));
     const rec = await this.ctx.storage.get<Rec>('rec');
     if (!rec) return json(404, { error: 'not found' });
     if (rec.expiresAt <= Date.now()) {
@@ -87,7 +92,6 @@ export class Secret extends DurableObject {
       return json(429, { retry_after_seconds: retry }, { 'retry-after': String(retry) });
     }
 
-    const sum = hex(await crypto.subtle.digest('SHA-256', hexToBytes(auth)));
     if (!constantTimeEqualHex(sum, rec.verifier!)) {
       rec.attempts = (rec.attempts ?? 0) + 1;
       rec.nextAllowedAt = Date.now() + cooldownMs(rec.attempts);
@@ -130,6 +134,9 @@ export class IPLimiter extends DurableObject {
 
   // Fixed window: returns seconds to wait when adding `add` would exceed max.
   private take(name: string, max: number, periodMs: number, add: number, now: number): number {
+    // One request must never exceed the whole window, and a negative or NaN
+    // addition must never widen it: either would defeat the cap outright.
+    if (!(add >= 0) || add > max) return Math.ceil(periodMs / 1000);
     const w = this.windows.get(name);
     if (!w || now - w.start >= periodMs) {
       this.windows.set(name, { start: now, count: add });
@@ -152,17 +159,21 @@ export class IPLimiter extends DurableObject {
     if (this.windows.size > 64) {
       for (const [k, w] of this.windows) if (now - w.start >= 3_600_000) this.windows.delete(k);
     }
-    let wait = this.take(bucket, Number(q('max', '60')), Number(q('period', '60')) * 1000, 1, now);
-    if (wait) return json(200, { allowed: false, limit: 'per_minute', retry_after_seconds: wait });
-    const hmax = Number(q('hmax', '0'));
-    if (hmax > 0) {
-      wait = this.take(`${bucket}:hour`, hmax, 3_600_000, 1, now);
-      if (wait) return json(200, { allowed: false, limit: 'per_hour', retry_after_seconds: wait });
+    // only=bytes charges the volume window alone: the request and hour windows
+    // were already charged by the caller's first, pre-body call.
+    if (q('only', '') !== 'bytes') {
+      const wait = this.take(bucket, Number(q('max', '60')), Number(q('period', '60')) * 1000, 1, now);
+      if (wait) return json(200, { allowed: false, limit: 'per_minute', retry_after_seconds: wait });
+      const hmax = Number(q('hmax', '0'));
+      if (hmax > 0) {
+        const hwait = this.take(`${bucket}:hour`, hmax, 3_600_000, 1, now);
+        if (hwait) return json(200, { allowed: false, limit: 'per_hour', retry_after_seconds: hwait });
+      }
     }
     const hbytes = Number(q('hbytes', '0'));
     if (hbytes > 0) {
-      wait = this.take(`${bucket}:bytes`, hbytes, 3_600_000, Number(q('bytes', '0')), now);
-      if (wait) return json(200, { allowed: false, limit: 'bytes_per_hour', retry_after_seconds: wait });
+      const bwait = this.take(`${bucket}:bytes`, hbytes, 3_600_000, Number(q('bytes', '0')), now);
+      if (bwait) return json(200, { allowed: false, limit: 'bytes_per_hour', retry_after_seconds: bwait });
     }
     return json(200, { allowed: true });
   }
