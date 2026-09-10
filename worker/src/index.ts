@@ -58,16 +58,20 @@ function recordStat(env: Env, ctx: ExecutionContext, request: Request, event: st
   })());
 }
 
-const LIMITS = { create: { max: 10, period: 60 }, claim: { max: 30, period: 60 } } as const;
+const LIMITS = { create: { max: 10, period: 60 }, claim: { max: 30, period: 60 }, env: { max: 60, period: 60 } } as const;
 
 // Returns {wait: 0} when allowed, else the seconds to wait and which limit
 // hit. Layer 1 is Cloudflare's eventually-consistent binding (cheap, catches
 // sustained floods); layer 2 is the exact per-IP Durable Object, which also
 // enforces the hourly create count and upload-volume caps (bulk dead-drop
 // guard). Both fail open — but loudly.
-async function rateLimited(env: Env, request: Request, bucket: keyof typeof LIMITS): Promise<{ wait: number; limit: string }> {
+// Passing `bytes` switches this to volume-only accounting, for the second call
+// made once the real body length is known; the request/hour windows are charged
+// by the first call so they are not double-counted.
+async function rateLimited(env: Env, request: Request, bucket: keyof typeof LIMITS, bytes?: number): Promise<{ wait: number; limit: string }> {
   const ip = clientIP(request);
-  const binding = bucket === 'create' ? env.CREATE_LIMIT : env.CLAIM_LIMIT;
+  const bytesOnly = bytes !== undefined;
+  const binding = bytesOnly ? undefined : bucket === 'create' ? env.CREATE_LIMIT : bucket === 'claim' ? env.CLAIM_LIMIT : undefined;
   try {
     if (binding && !(await binding.limit({ key: ip })).success) return { wait: LIMITS[bucket].period, limit: 'per_minute' };
   } catch (e) {
@@ -77,11 +81,11 @@ async function rateLimited(env: Env, request: Request, bucket: keyof typeof LIMI
     const stub = env.IPLIMIT.get(env.IPLIMIT.idFromName(ip));
     const { max, period } = LIMITS[bucket];
     let qs = `bucket=${bucket}&max=${max}&period=${period}`;
-    if (bucket === 'create') {
-      const hmax = Number(env.CREATE_PER_HOUR ?? '60');
+    if (bytesOnly) {
       const hbytes = Math.round(Number(env.CREATE_MIB_PER_HOUR ?? '256') * 1024 * 1024);
-      const bytes = Number(request.headers.get('content-length') ?? '0');
-      qs += `&hmax=${hmax}&hbytes=${hbytes}&bytes=${bytes}`;
+      qs += `&only=bytes&hbytes=${hbytes}&bytes=${bytes}`;
+    } else if (bucket === 'create') {
+      qs += `&hmax=${Number(env.CREATE_PER_HOUR ?? '60')}`;
     }
     const res = await stub.fetch(`https://do/limit?${qs}`);
     const body = (await res.json()) as { allowed: boolean; limit?: string; retry_after_seconds?: number };
@@ -114,7 +118,14 @@ const PROXY_HEADERS = ['via', 'x-bluecoat-via', 'x-zscaler-ip', 'x-zscaler-user'
 // A current browser reaches Cloudflare over HTTP/2 or HTTP/3; TLS-intercepting
 // proxies usually re-originate as HTTP/1.1. A modern browser UA arriving over
 // HTTP/1.1 is therefore a strong middlebox tell.
-function modernBrowser(ua: string): boolean {
+// Real browser UAs are far under 512 bytes; Cloudflare accepts headers up to
+// 128 KB. The Safari pattern below backtracks quadratically in a JS engine, so
+// the input is capped rather than the pattern -- keeping it byte-identical to
+// the Go fallback's regex, which is RE2 and needs no bound.
+const UA_MAX = 512;
+
+function modernBrowser(rawUA: string): boolean {
+  const ua = rawUA.slice(0, UA_MAX);
   const m = /(?:Chrome|CriOS|Chromium)\/(\d+)/.exec(ua);
   if (m) return Number(m[1]) >= 90;
   const f = /Firefox\/(\d+)/.exec(ua);
@@ -150,14 +161,16 @@ function json(code: number, body: unknown): Response {
 
 const err = (code: number, error: string) => json(code, { error });
 
-async function readJSON(request: Request, maxBytes: number): Promise<Record<string, unknown> | null> {
+// Returns the parsed body together with the number of bytes actually received,
+// which is what the volume cap must be charged -- never content-length.
+async function readJSON(request: Request, maxBytes: number): Promise<{ body: Record<string, unknown>; bytes: number } | null> {
   const len = Number(request.headers.get('content-length') ?? '0');
   if (len > maxBytes) return null;
   try {
     const text = await request.text();
     if (text.length > maxBytes) return null;
     const v = JSON.parse(text);
-    return typeof v === 'object' && v !== null ? v : null;
+    return typeof v === 'object' && v !== null ? { body: v, bytes: text.length } : null;
   } catch {
     return null;
   }
@@ -194,8 +207,17 @@ async function handleCreate(request: Request, env: Env, ctx: ExecutionContext): 
     recordStat(env, ctx, request, rl.limit === 'per_minute' ? 'rate_limited' : 'volume_limited', rl.limit);
     return tooMany(rl.wait);
   }
-  const body = await readJSON(request, MAX_BODY);
-  if (!body) return err(400, 'malformed body');
+  const read = await readJSON(request, MAX_BODY);
+  if (!read) return err(400, 'malformed body');
+  const body = read.body;
+  // Charge the bytes that actually arrived. content-length is client-declared:
+  // absent under chunked encoding, and freely understated otherwise.
+  const vol = await rateLimited(env, request, 'create', read.bytes);
+  if (vol.wait) {
+    alert(env, ctx, 'volume_limited', { bucket: 'create', limit: vol.limit });
+    recordStat(env, ctx, request, 'volume_limited', vol.limit);
+    return tooMany(vol.wait);
+  }
   const { id, ct, verifier } = body as { id?: string; ct?: string; verifier?: string };
   let ttl = (body.ttl_seconds as number | undefined) ?? 0;
   if (ttl === 0) ttl = DEFAULT_TTL;
@@ -223,7 +245,8 @@ async function handleClaim(request: Request, env: Env, ctx: ExecutionContext, id
     recordStat(env, ctx, request, 'rate_limited', 'claim');
     return tooMany(rl.wait);
   }
-  const body = await readJSON(request, 4096);
+  const read = await readJSON(request, 4096);
+  const body = read?.body;
   const auth = body?.auth;
   if (typeof auth !== 'string' || !HEX_RE.test(auth)) return err(400, 'malformed auth');
 
@@ -252,6 +275,8 @@ export default {
       return handleClaim(request, env, ctx, claimMatch[1]);
     }
     if (url.pathname === '/api/env' && request.method === 'GET') {
+      const rl = await rateLimited(env, request, 'env');
+      if (rl.wait) return tooMany(rl.wait);
       return json(200, environment(request));
     }
     if (url.pathname === '/api/stats' && request.method === 'GET') {
