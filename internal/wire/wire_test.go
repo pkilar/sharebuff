@@ -28,8 +28,9 @@ func TestTokens(t *testing.T) {
 			}
 		}
 	}
-	if len(NewLocator()) != LocatorLen || !ValidLocator(NewLocator()) {
-		t.Fatal("bad locator")
+	loc := NewLocator()
+	if len(loc) != LocatorLen || !ValidLocator(loc) {
+		t.Fatalf("bad locator %q (len %d)", loc, len(loc))
 	}
 	for _, bad := range []string{"", "ABCD", "ABCDEF", "ABCDU", "abcde"} {
 		if ValidLocator(bad) {
@@ -151,6 +152,89 @@ func TestSealOpenRoundtrip(t *testing.T) {
 	sum := sha256.Sum256(authKey)
 	if VerifierHex(authKey) != hex.EncodeToString(sum[:]) {
 		t.Fatal("verifier mismatch")
+	}
+}
+
+// TestSealOpenRejectBadLocatorAndSize: the locator is bound into the AAD, so
+// both directions must refuse one that could never have been issued, and Open
+// must reject an over-long blob before AES-GCM ever sees it.
+func TestSealOpenRejectBadLocatorAndSize(t *testing.T) {
+	loc := NewLocator()
+	encKey, _, err := Derive(NewKey(KeyLenTiny), NewPIN(6), loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", "ABCD", "ABCDEF", "ABCDU", "abcde"} {
+		if _, err := Seal(encKey, bad, []byte("x")); err == nil {
+			t.Errorf("Seal accepted locator %q", bad)
+		}
+		if _, err := Open(encKey, bad, make([]byte, NonceLen+16)); err == nil {
+			t.Errorf("Open accepted locator %q", bad)
+		}
+	}
+	if _, err := Open(encKey, loc, make([]byte, MaxBlob+1)); err == nil {
+		t.Error("Open accepted a blob past MaxBlob")
+	}
+	if _, err := Seal(encKey, loc, make([]byte, MaxEnvelope+1)); err == nil {
+		t.Error("Seal accepted an envelope past MaxEnvelope")
+	}
+}
+
+// TestOpenRejectsTampering exercises the forgery-rejection paths: every one of
+// these must fail closed, and the length guards must reject before AES-GCM is
+// ever reached.
+func TestOpenRejectsTampering(t *testing.T) {
+	loc := NewLocator()
+	encKey, _, err := Derive(NewKey(KeyLenTiny), NewPIN(6), loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := Seal(encKey, loc, []byte("tamper me"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(encKey, loc, blob); err != nil {
+		t.Fatalf("untampered blob must open: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{"shorter than nonce+tag", func(b []byte) []byte { return b[:NonceLen+15] }},
+		{"empty", func(b []byte) []byte { return nil }},
+		{"truncated by one byte", func(b []byte) []byte { return b[:len(b)-1] }},
+		{"flipped nonce bit", func(b []byte) []byte { b[0] ^= 0x01; return b }},
+		{"flipped ciphertext bit", func(b []byte) []byte { b[NonceLen] ^= 0x01; return b }},
+		{"flipped tag bit", func(b []byte) []byte { b[len(b)-1] ^= 0x01; return b }},
+		{"appended byte", func(b []byte) []byte { return append(b, 0x00) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := Open(encKey, loc, c.mutate(append([]byte(nil), blob...)))
+			if err == nil {
+				t.Fatalf("accepted a forged blob, returned %q", got)
+			}
+			if got != nil {
+				t.Fatalf("returned plaintext %q alongside an error", got)
+			}
+		})
+	}
+
+	// The AAD binds the blob to its locator, and the key must match.
+	other := NewLocator()
+	for other == loc {
+		other = NewLocator()
+	}
+	if _, err := Open(encKey, other, blob); err == nil {
+		t.Fatal("blob opened under a different locator")
+	}
+	otherKey, _, err := Derive(NewKey(KeyLenTiny), NewPIN(6), loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(otherKey, loc, blob); err == nil {
+		t.Fatal("blob opened under a different key")
 	}
 }
 
@@ -303,6 +387,37 @@ func TestVectors(t *testing.T) {
 		if vecs[i].Code != stored[i].Code || vecs[i].EncKeyHex != stored[i].EncKeyHex ||
 			vecs[i].AuthHex != stored[i].AuthHex || vecs[i].Verifier != stored[i].Verifier {
 			t.Fatalf("vector %d KDF/code output drifted from checked-in reference", i)
+		}
+	}
+	// ct_b64 carries a random nonce, so it can never be compared by equality --
+	// decrypting it is the only check that catches a Seal framing or AAD change
+	// that happens to leave the KDF outputs untouched.
+	for i, v := range stored {
+		ct, err := base64.StdEncoding.DecodeString(v.CT)
+		if err != nil {
+			t.Fatalf("vector %d: bad stored ct_b64: %v", i, err)
+		}
+		encKey, err := hex.DecodeString(v.EncKeyHex)
+		if err != nil {
+			t.Fatalf("vector %d: bad stored enc_key_hex: %v", i, err)
+		}
+		env, err := Open(encKey, v.Locator, ct)
+		if err != nil {
+			t.Fatalf("vector %d: cannot decrypt the pinned reference ciphertext: %v", i, err)
+		}
+		wantEnv, err := base64.StdEncoding.DecodeString(v.Envelope)
+		if err != nil {
+			t.Fatalf("vector %d: bad stored envelope_b64: %v", i, err)
+		}
+		if !bytes.Equal(env, wantEnv) {
+			t.Fatalf("vector %d: decrypted envelope differs from envelope_b64", i)
+		}
+		h, payload, err := DecodeEnvelope(env)
+		if err != nil {
+			t.Fatalf("vector %d: DecodeEnvelope: %v", i, err)
+		}
+		if h != fixed[i].header || !bytes.Equal(payload, fixed[i].payload) {
+			t.Fatalf("vector %d: pinned ciphertext decoded to %+v / %q", i, h, payload)
 		}
 	}
 }

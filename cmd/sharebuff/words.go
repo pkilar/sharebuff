@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"embed"
+	"fmt"
 	"math/big"
 	"sort"
 	"strings"
@@ -24,9 +25,16 @@ var wordFS embed.FS
 
 var wordlists = func() map[string][]string {
 	out := map[string][]string{}
-	entries, _ := wordFS.ReadDir("words")
+	entries, err := wordFS.ReadDir("words")
+	if err != nil {
+		panic(fmt.Errorf("sharebuff: reading embedded wordlist directory %q: %w", "words", err))
+	}
 	for _, e := range entries {
-		b, _ := wordFS.ReadFile("words/" + e.Name())
+		path := "words/" + e.Name()
+		b, err := wordFS.ReadFile(path)
+		if err != nil {
+			panic(fmt.Errorf("sharebuff: reading embedded wordlist %q: %w", path, err))
+		}
 		out[strings.TrimSuffix(e.Name(), ".txt")] = strings.Fields(string(b))
 	}
 	return out
