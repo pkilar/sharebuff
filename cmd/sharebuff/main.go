@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -144,6 +145,70 @@ the PIN over two different channels.
 }
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "sharebuff: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// uploadResult is what the caller needs once the secret is stored.
+type uploadResult struct {
+	Locator   string
+	ExpiresAt int64 // 0 when the server did not report one
+}
+
+// upload seals env under a fresh random locator and posts it, retrying on the
+// (rare) locator collision.
+//
+// A 201 is authoritative: the server stores the ciphertext before it answers,
+// so a reply body that fails to decode must never abort the run -- the code and
+// PIN the caller prints afterwards are the only way to reach the secret. That
+// case warns and reports an unknown expiry instead.
+func upload(client *http.Client, base string, env, key []byte, pin string, ttlSec int64, warn io.Writer) (uploadResult, error) {
+	for attempt := 0; ; attempt++ {
+		locator := wire.NewLocator()
+		encKey, authKey, err := wire.Derive(key, pin, locator)
+		if err != nil {
+			return uploadResult{}, fmt.Errorf("deriving keys: %w", err)
+		}
+		blob, err := wire.Seal(encKey, locator, env)
+		if err != nil {
+			return uploadResult{}, fmt.Errorf("encrypting: %w", err)
+		}
+		body, err := json.Marshal(createReq{
+			ID:         locator,
+			CT:         base64.StdEncoding.EncodeToString(blob),
+			Verifier:   wire.VerifierHex(authKey),
+			TTLSeconds: ttlSec,
+		})
+		if err != nil {
+			return uploadResult{}, fmt.Errorf("encoding request: %w", err)
+		}
+		resp, err := client.Post(base+"/api/secrets", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return uploadResult{}, fmt.Errorf("posting secret: %w", err)
+		}
+		var cr createResp
+		decErr := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&cr)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusCreated {
+			if decErr != nil {
+				fmt.Fprintf(warn, "warning: could not read the server's reply (%v) — the secret was stored, so the code and PIN below still work.\n", decErr)
+			}
+			return uploadResult{Locator: locator, ExpiresAt: cr.ExpiresAt}, nil
+		}
+		if resp.StatusCode == http.StatusConflict && attempt < 5 {
+			continue
+		}
+		if resp.StatusCode == http.StatusForbidden && len(cr.Reasons) > 0 {
+			return uploadResult{}, fmt.Errorf("%s — %s. This looks like a managed or corporate network, where sharing is not permitted (docs/SECURITY.md)", cr.Error, strings.Join(cr.Reasons, "; "))
+		}
+		return uploadResult{}, fmt.Errorf("server returned %s %s", resp.Status, cr.Error)
+	}
+}
+
+func run() error {
 	// No instance is baked in: point the CLI at your own Sharebuff server with
 	// SHAREBUFF_URL or --server (deploy one — see the README).
 	server := flag.String("server", os.Getenv("SHAREBUFF_URL"), "server base URL (or SHAREBUFF_URL env)")
@@ -161,47 +226,47 @@ func main() {
 	flag.Parse()
 
 	if *server == "" {
-		fatalf("no server configured — deploy your own instance and set SHAREBUFF_URL (or pass --server https://…). See the README.")
+		return errors.New("no server configured — deploy your own instance and set SHAREBUFF_URL (or pass --server https://…). See the README")
 	}
 	base := strings.TrimRight(*server, "/")
 	serverURL, err := url.Parse(base)
 	if err != nil {
-		fatalf("--server %q is not a valid URL: %v", *server, err)
+		return fmt.Errorf("--server %q is not a valid URL: %w", *server, err)
 	}
 	scheme := strings.ToLower(serverURL.Scheme)
 	host := strings.ToLower(serverURL.Hostname())
 	loopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
 	if scheme != "https" && !(scheme == "http" && loopback) {
-		fatalf("--server %q must use https:// (http:// is only allowed for localhost, 127.0.0.1, or [::1])", *server)
+		return fmt.Errorf("--server %q must use https:// (http:// is only allowed for localhost, 127.0.0.1, or [::1])", *server)
 	}
 	ttlSec := int64(ttl.Seconds())
 	if ttlSec < wire.MinTTLSeconds || ttlSec > wire.MaxTTLSeconds {
-		fatalf("--ttl must be between 1m and 168h")
+		return errors.New("--ttl must be between 1m and 168h")
 	}
 	if *pinLen != 0 && *pinLen < 6 {
-		fatalf("--pin-len must be at least 6")
+		return errors.New("--pin-len must be at least 6")
 	}
 	if *pinWords < 2 {
-		fatalf("--pin-words must be at least 2")
+		return errors.New("--pin-words must be at least 2")
 	}
 	if *pinWords > 10 {
-		fatalf("--pin-words must be at most 10")
+		return errors.New("--pin-words must be at most 10")
 	}
 	header, plain := readInput(*file, *clip)
 	defer clear(plain)
 	keyLen, escalated, err := chooseTier(*tiny, *short, *full, *auto, os.Getenv("SHAREBUFF_TIER"), header.T == "file", len(plain))
 	if err != nil {
-		fatalf("%v", err)
+		return err
 	}
 	if len(plain) == 0 {
-		fatalf("nothing to share (empty input)")
+		return errors.New("nothing to share (empty input)")
 	}
 	if len(plain) > wire.MaxPayload {
-		fatalf("input exceeds the %d MiB limit", wire.MaxPayload>>20)
+		return fmt.Errorf("input exceeds the %d MiB limit", wire.MaxPayload>>20)
 	}
 	env, err := wire.EncodeEnvelope(header, plain)
 	if err != nil {
-		fatalf("packing envelope: %v", err)
+		return fmt.Errorf("packing envelope: %w", err)
 	}
 
 	key := wire.NewKey(keyLen)
@@ -212,52 +277,12 @@ func main() {
 	}
 	client := &http.Client{Timeout: 5 * time.Minute} // large uploads on slow links
 
-	// The locator is public and random; on the (rare) collision the server
-	// answers 409 and we simply pick another one and re-derive.
-	var locator string
-	var cr createResp
-	for attempt := 0; ; attempt++ {
-		locator = wire.NewLocator()
-		encKey, authKey, err := wire.Derive(key, pin, locator)
-		if err != nil {
-			fatalf("deriving keys: %v", err)
-		}
-		blob, err := wire.Seal(encKey, locator, env)
-		if err != nil {
-			fatalf("encrypting: %v", err)
-		}
-		body, _ := json.Marshal(createReq{
-			ID:         locator,
-			CT:         base64.StdEncoding.EncodeToString(blob),
-			Verifier:   wire.VerifierHex(authKey),
-			TTLSeconds: ttlSec,
-		})
-		resp, err := client.Post(base+"/api/secrets", "application/json", bytes.NewReader(body))
-		if err != nil {
-			fatalf("posting secret: %v", err)
-		}
-		cr = createResp{}
-		err = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&cr)
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusCreated {
-			// The ciphertext is stored before the server answers 201, so the
-			// secret exists whatever the body looked like. Never exit here:
-			// the code and PIN printed below are the only way to reach it.
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not read the server's reply (%v) — the secret was stored, so the code and PIN below still work.\n", err)
-			}
-			break
-		}
-		if resp.StatusCode == http.StatusConflict && attempt < 5 {
-			continue
-		}
-		if resp.StatusCode == http.StatusForbidden && len(cr.Reasons) > 0 {
-			fatalf("%s — %s. This looks like a managed or corporate network, where sharing is not permitted (docs/SECURITY.md).", cr.Error, strings.Join(cr.Reasons, "; "))
-		}
-		fatalf("server returned %s %s", resp.Status, cr.Error)
+	posted, err := upload(client, base, env, key, pin, ttlSec, os.Stderr)
+	if err != nil {
+		return err
 	}
 
-	code := wire.EncodeCode(locator, key)
+	code := wire.EncodeCode(posted.Locator, key)
 	fmt.Printf("URL: %s/#%s\n", base, code)
 	fmt.Printf("PIN: %s\n", pin)
 	what := fmt.Sprintf("text (%s): %s", humanSize(len(plain)), preview(plain))
@@ -272,14 +297,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Using a 128-bit key (31-char code) for this payload: %s. Pass --tiny to force the 13-char code.\n", escalatedReason(header.T == "file"))
 	}
 	fmt.Fprintf(os.Stderr, "Typing instead of pasting? Open %s and enter the code %s\n", base, code)
-	if cr.ExpiresAt > 0 {
+	if posted.ExpiresAt > 0 {
 		fmt.Fprintf(os.Stderr, "Expires %s, on the first valid retrieve, or after %d wrong PINs.\n",
-			time.Unix(cr.ExpiresAt, 0).Local().Format(time.RFC1123), wire.MaxAttempts)
+			time.Unix(posted.ExpiresAt, 0).Local().Format(time.RFC1123), wire.MaxAttempts)
 	} else {
 		fmt.Fprintf(os.Stderr, "Expires at an unknown time (the server did not report one), on the first valid retrieve, or after %d wrong PINs.\n",
 			wire.MaxAttempts)
 	}
 	fmt.Fprintf(os.Stderr, "Share the code/URL and the PIN over two different channels.\n")
+	return nil
 }
 
 // AutoEscalateBytes is the text size above which the automatic tier choice
