@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,16 +13,20 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sourcefrenchy/sharebuff/internal/wire"
@@ -89,19 +94,21 @@ const statsDays = 30
 
 // record tallies an event. Caller must NOT hold s.mu (it locks itself).
 func (s *store) record(r *http.Request, event, reason string) {
-	cc := r.Header.Get("CF-IPCountry")
-	if cc == "" {
-		cc = "??"
-	}
-	city := r.Header.Get("CF-IPCity")
-	if city == "" {
-		city = "—"
-	}
-	asn := "—"
-	if org := r.Header.Get("X-ASN-Org"); org != "" && len(s.statsSalt) > 0 {
-		mac := hmac.New(sha256.New, s.statsSalt)
-		mac.Write([]byte(strings.ToUpper(org)))
-		asn = hex.EncodeToString(mac.Sum(nil)[:3])
+	// Geo/ASN headers only mean anything when a proxy we control sets them;
+	// otherwise any client can poison the public /api/stats feed.
+	cc, city, asn := "??", "—", "—"
+	if s.trustProxy {
+		if v := r.Header.Get("CF-IPCountry"); v != "" {
+			cc = v
+		}
+		if v := r.Header.Get("CF-IPCity"); v != "" {
+			city = v
+		}
+		if org := r.Header.Get("X-ASN-Org"); org != "" && len(s.statsSalt) > 0 {
+			mac := hmac.New(sha256.New, s.statsSalt)
+			mac.Write([]byte(strings.ToUpper(org)))
+			asn = hex.EncodeToString(mac.Sum(nil)[:3])
+		}
 	}
 	now := s.now().UTC()
 	day := now.Format("2006-01-02")
@@ -136,18 +143,21 @@ func (s *store) record(r *http.Request, event, reason string) {
 }
 
 func (s *store) statsHandler(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	totals := map[string]int{}
 	byDay := map[string]map[string]int{}
 	byGeo := map[string]map[string]int{}
 	feed := []statEvent{}
+	// Copy every map out under the lock: the response is encoded after it is
+	// released, and record/sweep keep mutating the originals.
+	s.mu.Lock()
 	if s.stats != nil {
 		for day, d := range s.stats.days {
-			byDay[day] = d.Totals
+			dayTotals := make(map[string]int, len(d.Totals))
 			for e, n := range d.Totals {
+				dayTotals[e] = n
 				totals[e] += n
 			}
+			byDay[day] = dayTotals
 			for g, counts := range d.Geo {
 				if byGeo[g] == nil {
 					byGeo[g] = map[string]int{}
@@ -157,8 +167,9 @@ func (s *store) statsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		feed = s.stats.feed
+		feed = append(feed, s.stats.feed...)
 	}
+	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=60")
 	_ = json.NewEncoder(w).Encode(map[string]any{"days": statsDays, "totals": totals, "by_day": byDay, "by_geo": byGeo, "feed": feed})
@@ -193,6 +204,11 @@ func (s *store) take(key string, max, add int64, period time.Duration, now time.
 	if max <= 0 {
 		return true, 0
 	}
+	// One request must never exceed the whole window, and a negative addition
+	// must never widen it: either would defeat the cap outright.
+	if add < 0 || add > max {
+		return false, int(period/time.Second) + 1
+	}
 	w := s.rl[key]
 	if w == nil || now.Sub(w.start) >= period {
 		s.rl[key] = &window{start: now, count: add}
@@ -221,6 +237,10 @@ func (s *store) allowVolume(ip string, bytes int64, now time.Time) (ok bool, ret
 	return true, 0, ""
 }
 
+// alertClient is shared: alerts fire exactly when the server is busiest, so
+// that is the wrong moment to build a fresh client and connection pool.
+var alertClient = &http.Client{Timeout: 5 * time.Second}
+
 // alert emits a structured event to the log and, if configured, to the
 // webhook. Never includes payloads, proofs, or client IPs.
 func (s *store) alert(event string, fields map[string]any) {
@@ -230,8 +250,7 @@ func (s *store) alert(event string, fields map[string]any) {
 	log.Printf("alert %s", b)
 	if s.alertWebhook != "" {
 		go func() {
-			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Post(s.alertWebhook, "application/json", bytes.NewReader(b))
+			resp, err := alertClient.Post(s.alertWebhook, "application/json", bytes.NewReader(b))
 			if err == nil {
 				resp.Body.Close()
 			}
@@ -252,14 +271,16 @@ var (
 // modernBrowser reports whether ua is a current browser, which would normally
 // speak HTTP/2+; seeing one over HTTP/1.x suggests a TLS-intercepting proxy.
 func modernBrowser(ua string) bool {
-	atLeast := func(re *regexp.Regexp, min int) (bool, bool) {
+	atLeast := func(re *regexp.Regexp, minVersion int) (bool, bool) {
 		m := re.FindStringSubmatch(ua)
 		if m == nil {
 			return false, false
 		}
-		var v int
-		fmt.Sscanf(m[1], "%d", &v)
-		return true, v >= min
+		v, err := strconv.Atoi(m[1])
+		if err != nil {
+			return true, false
+		}
+		return true, v >= minVersion
 	}
 	if ok, modern := atLeast(chromeRe, 90); ok {
 		return modern
@@ -305,6 +326,18 @@ func (s *store) environment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"share": len(reasons) == 0, "reasons": reasons})
 }
 
+// goneEvent maps a tombstone reason to its stats event suffix.
+func goneEvent(gone string) string {
+	switch gone {
+	case "claimed":
+		return "gone"
+	case "burned":
+		return "burned"
+	default:
+		return "unknown"
+	}
+}
+
 // cooldown returns the wait imposed after the n-th counted wrong attempt.
 func cooldown(attempts int) time.Duration {
 	if attempts >= 30 || 1<<attempts > wire.CooldownMaxSeconds {
@@ -313,21 +346,33 @@ func cooldown(attempts int) time.Duration {
 	return time.Duration(1<<attempts) * time.Second
 }
 
-func (s *store) janitor() {
-	for range time.Tick(time.Minute) {
-		now := s.now()
-		s.mu.Lock()
-		for id, r := range s.m {
-			if now.After(r.expiresAt) {
-				delete(s.m, id)
-			}
+// sweep drops expired records and stale rate-limit windows.
+func (s *store) sweep(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, r := range s.m {
+		if now.After(r.expiresAt) {
+			delete(s.m, id)
 		}
-		for k, w := range s.rl {
-			if now.Sub(w.start) >= 2*time.Hour {
-				delete(s.rl, k)
-			}
+	}
+	for k, w := range s.rl {
+		if now.Sub(w.start) >= 2*time.Hour {
+			delete(s.rl, k)
 		}
-		s.mu.Unlock()
+	}
+}
+
+// janitor sweeps once a minute until ctx is cancelled.
+func (s *store) janitor(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.sweep(s.now())
+		}
 	}
 }
 
@@ -361,25 +406,33 @@ func (s *store) create(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	s.mu.Lock()
 	ok, retry := s.allow("create", ip, s.createRPM, s.now())
-	limit := "per_minute"
-	if ok {
-		ok, retry, limit = s.allowVolume(ip, r.ContentLength, s.now())
-	}
 	s.mu.Unlock()
 	if !ok {
-		event := "rate_limited"
-		if limit != "per_minute" {
-			event = "volume_limited"
-		}
-		s.alert(event, map[string]any{"bucket": "create", "limit": limit})
-		s.record(r, event, limit)
-		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
+		s.alert("rate_limited", map[string]any{"bucket": "create", "limit": "per_minute"})
+		s.record(r, "rate_limited", "per_minute")
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many requests", "retry_after_seconds": retry})
 		return
 	}
 	// Blob cap is ~20 MiB; base64 (+33%) plus JSON framing fits in 32 MiB.
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
-	if err != nil || json.Unmarshal(body, &req) != nil {
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "malformed body")
+		return
+	}
+	// Meter what actually arrived. r.ContentLength is client-declared: it can be
+	// negative for chunked bodies, or large enough to overflow the window.
+	s.mu.Lock()
+	ok, retry, limit := s.allowVolume(ip, int64(len(body)), s.now())
+	s.mu.Unlock()
+	if !ok {
+		s.alert("volume_limited", map[string]any{"bucket": "create", "limit": limit})
+		s.record(r, "volume_limited", limit)
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many requests", "retry_after_seconds": retry})
+		return
+	}
+	if json.Unmarshal(body, &req) != nil {
 		errJSON(w, http.StatusBadRequest, "malformed body")
 		return
 	}
@@ -408,15 +461,16 @@ func (s *store) create(w http.ResponseWriter, r *http.Request) {
 	copy(rec.verifier[:], verifier)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.m[req.ID]; exists {
+	_, exists := s.m[req.ID]
+	if !exists {
+		s.m[req.ID] = rec
+	}
+	s.mu.Unlock()
+	if exists {
 		errJSON(w, http.StatusConflict, "id already exists")
 		return
 	}
-	s.m[req.ID] = rec
-	s.mu.Unlock()
 	s.record(r, "create", "")
-	s.mu.Lock()
 	writeJSON(w, http.StatusCreated, map[string]int64{"expires_at": rec.expiresAt.Unix()})
 }
 
@@ -433,15 +487,16 @@ func (s *store) claim(w http.ResponseWriter, r *http.Request) {
 	authBytes, _ := hex.DecodeString(req.Auth)
 	sum := sha256.Sum256(authBytes)
 
+	// Every branch below decides and mutates under the lock, then releases it
+	// before alerting, recording or writing. s.mu guards every handler and the
+	// janitor, so a slow reader must never be able to hold it across a Write.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now()
 	if ok, retry := s.allow("claim", s.clientIP(r), s.claimRPM, now); !ok {
-		s.alert("rate_limited", map[string]any{"bucket": "claim"})
 		s.mu.Unlock()
+		s.alert("rate_limited", map[string]any{"bucket": "claim"})
 		s.record(r, "rate_limited", "claim")
-		s.mu.Lock()
-		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many requests", "retry_after_seconds": retry})
 		return
 	}
@@ -450,42 +505,41 @@ func (s *store) claim(w http.ResponseWriter, r *http.Request) {
 		delete(s.m, id)
 		s.mu.Unlock()
 		s.record(r, "claim_missing", "")
-		s.mu.Lock()
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
 	if rec.gone != "" {
+		gone := rec.gone
 		s.mu.Unlock()
-		s.record(r, "claim_"+map[string]string{"claimed": "gone", "burned": "burned"}[rec.gone], "")
-		s.mu.Lock()
-		writeJSON(w, http.StatusGone, map[string]string{"reason": rec.gone})
+		s.record(r, "claim_"+goneEvent(gone), "")
+		writeJSON(w, http.StatusGone, map[string]string{"reason": gone})
 		return
 	}
 	// Cooldown gate: rejected before the proof is examined, and NOT counted —
 	// hammering can neither brute-force the PIN nor burn the secret.
 	if now.Before(rec.nextAllowedAt) {
 		retry := int64(rec.nextAllowedAt.Sub(now).Seconds()) + 1
-		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
+		s.mu.Unlock()
+		w.Header().Set("Retry-After", strconv.FormatInt(retry, 10))
 		writeJSON(w, http.StatusTooManyRequests, map[string]int64{"retry_after_seconds": retry})
 		return
 	}
 	if subtle.ConstantTimeCompare(sum[:], rec.verifier[:]) != 1 {
 		rec.attempts++
 		rec.nextAllowedAt = now.Add(cooldown(rec.attempts))
-		if rec.attempts >= wire.MaxAttempts {
+		attempts := rec.attempts
+		if attempts >= wire.MaxAttempts {
 			// Burn: keep only a tombstone until the original expiry.
 			s.m[id] = &record{gone: "burned", expiresAt: rec.expiresAt}
-			s.alert("secret_burned", map[string]any{"locator": id})
 			s.mu.Unlock()
+			s.alert("secret_burned", map[string]any{"locator": id})
 			s.record(r, "claim_burned", "")
-			s.mu.Lock()
 			writeJSON(w, http.StatusGone, map[string]string{"reason": "burned"})
 			return
 		}
 		s.mu.Unlock()
 		s.record(r, "claim_wrong", "")
-		s.mu.Lock()
-		writeJSON(w, http.StatusForbidden, map[string]int{"attempts_left": wire.MaxAttempts - rec.attempts})
+		writeJSON(w, http.StatusForbidden, map[string]int{"attempts_left": wire.MaxAttempts - attempts})
 		return
 	}
 	// Valid claim: destroy before responding; exactly one caller can get here.
@@ -493,7 +547,6 @@ func (s *store) claim(w http.ResponseWriter, r *http.Request) {
 	s.m[id] = &record{gone: "claimed", expiresAt: rec.expiresAt}
 	s.mu.Unlock()
 	s.record(r, "claim_ok", "")
-	s.mu.Lock()
 	writeJSON(w, http.StatusOK, map[string]string{"ct": base64.StdEncoding.EncodeToString(ct)})
 }
 
@@ -508,6 +561,7 @@ func staticHandler() http.Handler {
 		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		h.Set("Cache-Control", "no-store")
@@ -547,7 +601,9 @@ func main() {
 	s := &store{m: make(map[string]*record), maxTTL: *maxTTL, now: time.Now, allowShare: *share, enforce: *enforce,
 		createRPM: *createRPM, claimRPM: *claimRPM, createPerHour: *createPerHour, createBytesHour: int64(*mibPerHour) << 20,
 		trustProxy: *trustProxy, rl: make(map[string]*window), alertWebhook: *alertWebhook, statsSalt: salt}
-	go s.janitor()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go s.janitor(ctx)
 	mux := newMux(s)
 
 	log.Printf("sharebuff-server listening on %s (max TTL %s)", *addr, *maxTTL)
@@ -558,5 +614,18 @@ func main() {
 		ReadTimeout:       5 * time.Minute, // ~27 MB uploads on slow links
 		WriteTimeout:      5 * time.Minute,
 	}
-	log.Fatal(srv.ListenAndServe())
+	// Drain in-flight claims: a secret is tombstoned before its ciphertext is
+	// written, so dropping that response would destroy the only copy.
+	go func() {
+		<-ctx.Done()
+		stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown: %v", err)
+		}
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }

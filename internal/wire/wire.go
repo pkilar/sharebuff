@@ -1,6 +1,8 @@
-// Package wire implements the Sharebuff v4 crypto and encoding primitives
-// shared by the CLI and the fallback server. See docs/SPEC.md and
-// docs/SECURITY.md.
+// Package wire implements the Sharebuff v4 crypto and encoding primitives.
+// The CLI seals; the fallback server uses only the size and attempt limits.
+// The decode half (Open, DecodeCode, DecodeEnvelope) is the Go reference the
+// browser implementation is checked against in testdata/. See docs/SPEC.md
+// and docs/SECURITY.md.
 package wire
 
 import (
@@ -164,7 +166,8 @@ func DecodeCode(code string) (locator string, key []byte, err error) {
 	if !ValidLocator(locator) {
 		return "", nil, errors.New("wire: invalid locator character")
 	}
-	if len(rest) != 8 && len(rest) != 26 && len(rest) != 52 {
+	if l := len(rest); l != crockford.EncodedLen(KeyLenTiny) &&
+		l != crockford.EncodedLen(KeyLenShort) && l != crockford.EncodedLen(KeyLenFull) {
 		return "", nil, errors.New("wire: key part must be 8, 26 or 52 characters")
 	}
 	key, err = crockford.DecodeString(rest)
@@ -186,6 +189,7 @@ func Derive(key []byte, pin, locator string) (encKey, authKey []byte, err error)
 		return nil, nil, errors.New("wire: bad key length or locator")
 	}
 	password := append(append([]byte{}, key...), []byte(NormalizePIN(pin))...)
+	defer clear(password)
 	root, err := scrypt.Key(password, []byte(saltPrefix+locator), ScryptN, ScryptR, ScryptP, rootLen)
 	if err != nil {
 		return nil, nil, err
@@ -210,6 +214,9 @@ func gcmFor(encKey []byte) (cipher.AEAD, error) {
 // Seal encrypts an envelope, returning nonce||ciphertext||tag, bound to the
 // locator through the AAD.
 func Seal(encKey []byte, locator string, plaintext []byte) ([]byte, error) {
+	if !ValidLocator(locator) {
+		return nil, errors.New("wire: invalid locator")
+	}
 	if len(plaintext) > MaxEnvelope {
 		return nil, errors.New("wire: envelope exceeds the maximum size")
 	}
@@ -223,8 +230,14 @@ func Seal(encKey []byte, locator string, plaintext []byte) ([]byte, error) {
 
 // Open decrypts a Seal blob.
 func Open(encKey []byte, locator string, blob []byte) ([]byte, error) {
+	if !ValidLocator(locator) {
+		return nil, errors.New("wire: invalid locator")
+	}
 	if len(blob) < NonceLen+16 {
 		return nil, errors.New("wire: blob too short")
+	}
+	if len(blob) > MaxBlob {
+		return nil, errors.New("wire: blob exceeds the maximum size")
 	}
 	aead, err := gcmFor(encKey)
 	if err != nil {
@@ -269,8 +282,10 @@ func DecodeEnvelope(b []byte) (Header, []byte, error) {
 	if len(b) < 4 {
 		return h, nil, errors.New("wire: envelope truncated")
 	}
-	hlen := int(binary.BigEndian.Uint32(b[0:4]))
-	if hlen > MaxHeader || 4+hlen > len(b) {
+	// Compare before narrowing: on a 32-bit int, int(uint32(0xFFFFFFFF)) is -1
+	// and would slip past both bounds checks straight into a slice panic.
+	hlen := uint64(binary.BigEndian.Uint32(b[0:4]))
+	if hlen > MaxHeader || 4+hlen > uint64(len(b)) {
 		return h, nil, errors.New("wire: envelope header out of bounds")
 	}
 	if err := json.Unmarshal(b[4:4+hlen], &h); err != nil {

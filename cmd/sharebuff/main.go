@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -128,7 +129,7 @@ Code size: --tiny (13 chars, 40-bit key; the default), --short (31, 128-bit),
 and text over 4 KiB). Set SHAREBUFF_TIER=tiny|short|full|auto to fix a default.
 
 PIN: 3 dictionary words by default, each from a different language in random
-order (e.g. basil-tigre-souple, ~40 bits); --pin-words 4 (~52) or 6, or
+order (e.g. basil-tigre-souple, ~38 bits); --pin-words 4 (~50) or 6, or
 --pin-len N for N random characters. Expiry: 1 hour by default (--ttl).
 
 Flags:
@@ -147,7 +148,7 @@ func main() {
 	// SHAREBUFF_URL or --server (deploy one — see the README).
 	server := flag.String("server", os.Getenv("SHAREBUFF_URL"), "server base URL (or SHAREBUFF_URL env)")
 	ttl := flag.Duration("ttl", time.Hour, "time-to-live (1m..168h)")
-	pinWords := flag.Int("pin-words", 3, "PIN as N dictionary words, each from a different language (3 ≈ 40 bits, 4 ≈ 52)")
+	pinWords := flag.Int("pin-words", 3, "PIN as N dictionary words, each from a different language (3 ≈ 38 bits, 4 ≈ 50)")
 	pinLen := flag.Int("pin-len", 0, "instead of words: PIN as N random characters (min 6, 5 bits each)")
 	clip := flag.Bool("clip", false, "read from the system clipboard even when stdin is piped")
 	file := flag.String("file", "", "send this file instead of text (filename/MIME are encrypted too)")
@@ -163,6 +164,16 @@ func main() {
 		fatalf("no server configured — deploy your own instance and set SHAREBUFF_URL (or pass --server https://…). See the README.")
 	}
 	base := strings.TrimRight(*server, "/")
+	serverURL, err := url.Parse(base)
+	if err != nil {
+		fatalf("--server %q is not a valid URL: %v", *server, err)
+	}
+	scheme := strings.ToLower(serverURL.Scheme)
+	host := strings.ToLower(serverURL.Hostname())
+	loopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if scheme != "https" && !(scheme == "http" && loopback) {
+		fatalf("--server %q must use https:// (http:// is only allowed for localhost, 127.0.0.1, or [::1])", *server)
+	}
 	ttlSec := int64(ttl.Seconds())
 	if ttlSec < wire.MinTTLSeconds || ttlSec > wire.MaxTTLSeconds {
 		fatalf("--ttl must be between 1m and 168h")
@@ -173,7 +184,11 @@ func main() {
 	if *pinWords < 2 {
 		fatalf("--pin-words must be at least 2")
 	}
+	if *pinWords > 10 {
+		fatalf("--pin-words must be at most 10")
+	}
 	header, plain := readInput(*file, *clip)
+	defer clear(plain)
 	keyLen, escalated, err := chooseTier(*tiny, *short, *full, *auto, os.Getenv("SHAREBUFF_TIER"), header.T == "file", len(plain))
 	if err != nil {
 		fatalf("%v", err)
@@ -190,6 +205,7 @@ func main() {
 	}
 
 	key := wire.NewKey(keyLen)
+	defer clear(key)
 	pin := newWordPIN(*pinWords)
 	if *pinLen > 0 {
 		pin = wire.NewPIN(*pinLen)
@@ -221,9 +237,12 @@ func main() {
 			fatalf("posting secret: %v", err)
 		}
 		cr = createResp{}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&cr)
+		err = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&cr)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusCreated {
+			if err != nil {
+				fatalf("decoding server response: %v", err)
+			}
 			break
 		}
 		if resp.StatusCode == http.StatusConflict && attempt < 5 {
@@ -247,7 +266,7 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "\nPosted %s\nEncrypted locally; the server cannot read it (not even the filename).\n", what)
 	if escalated {
-		fmt.Fprintf(os.Stderr, "Using a 128-bit key (31-char code) for this payload: %s. Pass --tiny to force the 13-char code.\n", escalated_reason(header.T == "file"))
+		fmt.Fprintf(os.Stderr, "Using a 128-bit key (31-char code) for this payload: %s. Pass --tiny to force the 13-char code.\n", escalatedReason(header.T == "file"))
 	}
 	fmt.Fprintf(os.Stderr, "Typing instead of pasting? Open %s and enter the code %s\n", base, code)
 	fmt.Fprintf(os.Stderr, "Expires %s, on the first valid retrieve, or after %d wrong PINs.\n",
@@ -260,7 +279,7 @@ func main() {
 // enough to crack a large or file payload (THREAT-REVIEW T3).
 const AutoEscalateBytes = 4096
 
-func escalated_reason(isFile bool) string {
+func escalatedReason(isFile bool) string {
 	if isFile {
 		return "files always get it"
 	}
@@ -337,11 +356,11 @@ func humanSize(n int) string {
 // control characters collapsed to spaces, "…" when truncated) so the user
 // can confirm what was posted without the whole payload hitting the terminal.
 func preview(b []byte) string {
-	const max = 40
+	const maxRunes = 40
 	runes := []rune(strings.ToValidUTF8(string(b), "�"))
-	truncated := len(runes) > max
+	truncated := len(runes) > maxRunes
 	if truncated {
-		runes = runes[:max]
+		runes = runes[:maxRunes]
 	}
 	for i, r := range runes {
 		if r < 0x20 || r == 0x7f {

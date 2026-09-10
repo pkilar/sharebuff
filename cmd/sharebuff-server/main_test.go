@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -91,9 +94,55 @@ func post(t *testing.T, url string, body any) (int, map[string]any) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading %s: %v", url, err)
+	}
 	var out map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("decoding %s response (%d): %v; body=%q", url, resp.StatusCode, err, raw)
+		}
+	}
 	return resp.StatusCode, out
+}
+
+// numField and friends fail the test cleanly instead of panicking when the
+// server answers with an unexpected shape.
+func numField(t *testing.T, body map[string]any, key string) int {
+	t.Helper()
+	v, ok := body[key].(float64)
+	if !ok {
+		t.Fatalf("%q missing or not a number in %v", key, body)
+	}
+	return int(v)
+}
+
+func strField(t *testing.T, body map[string]any, key string) string {
+	t.Helper()
+	v, ok := body[key].(string)
+	if !ok {
+		t.Fatalf("%q missing or not a string in %v", key, body)
+	}
+	return v
+}
+
+func boolField(t *testing.T, body map[string]any, key string) bool {
+	t.Helper()
+	v, ok := body[key].(bool)
+	if !ok {
+		t.Fatalf("%q missing or not a bool in %v", key, body)
+	}
+	return v
+}
+
+func sliceField(t *testing.T, body map[string]any, key string) []any {
+	t.Helper()
+	v, ok := body[key].([]any)
+	if !ok {
+		t.Fatalf("%q missing or not an array in %v", key, body)
+	}
+	return v
 }
 
 func create(t *testing.T, ts *httptest.Server, sec secret) {
@@ -125,7 +174,7 @@ func TestClaimLifecycle(t *testing.T) {
 	// past each cooldown so the attempts are counted).
 	for i := 1; i <= 2; i++ {
 		code, body := post(t, ts.URL+"/api/secrets/"+sec.id+"/claim", map[string]string{"auth": badAuth})
-		if code != 403 || int(body["attempts_left"].(float64)) != wire.MaxAttempts-i {
+		if code != 403 || numField(t, body, "attempts_left") != wire.MaxAttempts-i {
 			t.Fatalf("bad claim %d: code=%d body=%v", i, code, body)
 		}
 		clk.Advance(time.Duration(wire.CooldownMaxSeconds+1) * time.Second)
@@ -133,7 +182,7 @@ func TestClaimLifecycle(t *testing.T) {
 
 	// Valid claim returns the ciphertext and destroys the record.
 	code, body := post(t, claimURL, map[string]string{"auth": sec.authHex})
-	if code != 200 || body["ct"].(string) != sec.ct {
+	if code != 200 || strField(t, body, "ct") != sec.ct {
 		t.Fatalf("valid claim: code=%d", code)
 	}
 
@@ -180,7 +229,7 @@ func TestCooldown(t *testing.T) {
 
 	// First wrong attempt is counted (attempts_left 9) and starts a 2s cooldown.
 	code, body := post(t, claimURL, map[string]string{"auth": badAuth})
-	if code != 403 || int(body["attempts_left"].(float64)) != wire.MaxAttempts-1 {
+	if code != 403 || numField(t, body, "attempts_left") != wire.MaxAttempts-1 {
 		t.Fatalf("first wrong: code=%d body=%v", code, body)
 	}
 	// Hammering during the cooldown: all 429, none counted — even with the
@@ -198,7 +247,7 @@ func TestCooldown(t *testing.T) {
 	// After the window: the counter did not move (still 8 left after this one)...
 	clk.Advance(3 * time.Second)
 	if code, body := post(t, claimURL, map[string]string{"auth": badAuth}); code != 403 ||
-		int(body["attempts_left"].(float64)) != wire.MaxAttempts-2 {
+		numField(t, body, "attempts_left") != wire.MaxAttempts-2 {
 		t.Fatalf("post-cooldown wrong: code=%d body=%v", code, body)
 	}
 	// ...and the correct PIN still works once its cooldown (4s) passes.
@@ -274,7 +323,7 @@ func TestLargePayloadRoundtrip(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("claim: %d", code)
 	}
-	if body["ct"].(string) != sec.ct {
+	if strField(t, body, "ct") != sec.ct {
 		t.Fatal("large ciphertext corrupted in transit")
 	}
 }
@@ -293,7 +342,7 @@ func TestEnvironmentSignals(t *testing.T) {
 		defer resp.Body.Close()
 		var out map[string]any
 		_ = json.NewDecoder(resp.Body).Decode(&out)
-		return out["share"].(bool), out["reasons"].([]any)
+		return boolField(t, out, "share"), sliceField(t, out, "reasons")
 	}
 	if share, reasons := get(nil); !share || len(reasons) != 0 {
 		t.Fatalf("clean request: share=%v reasons=%v", share, reasons)
@@ -374,7 +423,7 @@ func TestShareDisabledByOperator(t *testing.T) {
 	defer resp.Body.Close()
 	var out map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	if out["share"].(bool) {
+	if boolField(t, out, "share") {
 		t.Fatal("operator -share=false not honoured")
 	}
 }
@@ -572,7 +621,7 @@ func TestStats(t *testing.T) {
 		t.Fatalf("feed %v", out.Feed)
 	}
 	// ASN tag: keyed, stable across calls, never the org name.
-	s := &store{now: time.Now, statsSalt: []byte("k")}
+	s := &store{now: time.Now, statsSalt: []byte("k"), trustProxy: true}
 	r1, _ := http.NewRequest("POST", "/", nil)
 	r1.Header.Set("X-ASN-Org", "Zscaler Inc")
 	s.record(r1, "refused", "x")
@@ -585,6 +634,131 @@ func TestStats(t *testing.T) {
 		tag := strings.Split(g, "|")[2]
 		if len(tag) != 6 || strings.Contains(strings.ToUpper(g), "ZSCALER") {
 			t.Fatalf("asn tag %q leaks or is malformed", g)
+		}
+	}
+}
+
+// TestSweep covers the janitor's work directly: it is what enforces the TTL
+// and retires stale rate-limit windows.
+func TestSweep(t *testing.T) {
+	clk := &fakeClock{t: time.Now()}
+	s := &store{m: make(map[string]*record), now: clk.Now, rl: make(map[string]*window)}
+	s.m["LIVE1"] = &record{expiresAt: clk.Now().Add(time.Hour)}
+	s.m["DEAD1"] = &record{expiresAt: clk.Now().Add(-time.Second)}
+	s.rl["fresh"] = &window{start: clk.Now(), count: 1}
+	s.rl["stale"] = &window{start: clk.Now().Add(-3 * time.Hour), count: 1}
+
+	s.sweep(clk.Now())
+
+	if _, ok := s.m["LIVE1"]; !ok {
+		t.Error("sweep dropped a live record")
+	}
+	if _, ok := s.m["DEAD1"]; ok {
+		t.Error("sweep kept an expired record")
+	}
+	if _, ok := s.rl["fresh"]; !ok {
+		t.Error("sweep dropped a fresh rate-limit window")
+	}
+	if _, ok := s.rl["stale"]; ok {
+		t.Error("sweep kept a stale rate-limit window")
+	}
+	clk.Advance(2 * time.Hour)
+	s.sweep(clk.Now())
+	if _, ok := s.m["LIVE1"]; ok {
+		t.Error("sweep kept a record past its expiry")
+	}
+}
+
+// TestTakeRejectsOversizedAndNegative: the byte cap is metered with amounts
+// derived from the request, so one huge or negative addition must not be able
+// to overflow the window or run the counter backwards.
+func TestTakeRejectsOversizedAndNegative(t *testing.T) {
+	s := &store{rl: make(map[string]*window), now: time.Now}
+	now := time.Now()
+	const limit = 1 << 20
+	if ok, _ := s.take("k", limit, math.MaxInt64, time.Hour, now); ok {
+		t.Fatal("accepted an addition larger than the whole window")
+	}
+	if ok, _ := s.take("k", limit, -1, time.Hour, now); ok {
+		t.Fatal("accepted a negative addition")
+	}
+	if ok, _ := s.take("k", limit, limit, time.Hour, now); !ok {
+		t.Fatal("rejected a legitimate full-window addition")
+	}
+	if ok, _ := s.take("k", limit, 1, time.Hour, now); ok {
+		t.Fatal("cap not enforced once the window was full")
+	}
+}
+
+func TestJanitorStopsOnContextCancel(t *testing.T) {
+	s := &store{m: make(map[string]*record), now: time.Now, rl: make(map[string]*window)}
+	// Background is the deliberate parent here: the test owns the cancellation.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.janitor(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("janitor did not stop when its context was cancelled")
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/", nil)
+	r.RemoteAddr = "192.0.2.10:1234"
+	r.Header.Set("X-Real-IP", "203.0.113.1")
+	r.Header.Set("X-Forwarded-For", "203.0.113.2, 10.0.0.1")
+
+	if got := (&store{}).clientIP(r); got != "192.0.2.10" {
+		t.Errorf("untrusted: got %q, want the socket address 192.0.2.10", got)
+	}
+	if got := (&store{trustProxy: true}).clientIP(r); got != "203.0.113.1" {
+		t.Errorf("trusted: got %q, want X-Real-IP 203.0.113.1", got)
+	}
+	r.Header.Del("X-Real-IP")
+	if got := (&store{trustProxy: true}).clientIP(r); got != "203.0.113.2" {
+		t.Errorf("trusted XFF: got %q, want the first hop 203.0.113.2", got)
+	}
+	r2, _ := http.NewRequest("POST", "/", nil)
+	r2.RemoteAddr = "no-port-here"
+	if got := (&store{}).clientIP(r2); got != "no-port-here" {
+		t.Errorf("unparseable RemoteAddr: got %q, want it returned verbatim", got)
+	}
+}
+
+func TestModernBrowser(t *testing.T) {
+	cases := []struct {
+		name string
+		ua   string
+		want bool
+	}{
+		{"chrome current", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", true},
+		{"chrome ancient", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.0.0 Safari/537.36", false},
+		{"firefox current", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0", true},
+		{"firefox ancient", "Mozilla/5.0 (X11; Linux x86_64; rv:52.0) Gecko/20100101 Firefox/52.0", false},
+		{"safari current", "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15", true},
+		{"version overflows int", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99999999999999999999 Safari/537.36", false},
+		{"not a browser", "curl/8.5.0", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := modernBrowser(c.ua); got != c.want {
+				t.Errorf("modernBrowser(%q) = %v, want %v", c.ua, got, c.want)
+			}
+		})
+	}
+}
+
+func TestGoneEvent(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"claimed", "gone"},
+		{"burned", "burned"},
+		{"", "unknown"},
+		{"some-future-state", "unknown"},
+	} {
+		if got := goneEvent(c.in); got != c.want {
+			t.Errorf("goneEvent(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

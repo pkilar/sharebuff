@@ -1,5 +1,5 @@
 module github.com/sourcefrenchy/sharebuff
 
-go 1.26.6
+go 1.27.1
 
-require golang.org/x/crypto v0.55.0 // indirect
+require golang.org/x/crypto v0.57.0
