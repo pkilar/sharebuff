@@ -240,8 +240,11 @@ func main() {
 		err = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&cr)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusCreated {
+			// The ciphertext is stored before the server answers 201, so the
+			// secret exists whatever the body looked like. Never exit here:
+			// the code and PIN printed below are the only way to reach it.
 			if err != nil {
-				fatalf("decoding server response: %v", err)
+				fmt.Fprintf(os.Stderr, "warning: could not read the server's reply (%v) — the secret was stored, so the code and PIN below still work.\n", err)
 			}
 			break
 		}
@@ -269,8 +272,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Using a 128-bit key (31-char code) for this payload: %s. Pass --tiny to force the 13-char code.\n", escalatedReason(header.T == "file"))
 	}
 	fmt.Fprintf(os.Stderr, "Typing instead of pasting? Open %s and enter the code %s\n", base, code)
-	fmt.Fprintf(os.Stderr, "Expires %s, on the first valid retrieve, or after %d wrong PINs.\n",
-		time.Unix(cr.ExpiresAt, 0).Local().Format(time.RFC1123), wire.MaxAttempts)
+	if cr.ExpiresAt > 0 {
+		fmt.Fprintf(os.Stderr, "Expires %s, on the first valid retrieve, or after %d wrong PINs.\n",
+			time.Unix(cr.ExpiresAt, 0).Local().Format(time.RFC1123), wire.MaxAttempts)
+	} else {
+		fmt.Fprintf(os.Stderr, "Expires at an unknown time (the server did not report one), on the first valid retrieve, or after %d wrong PINs.\n",
+			wire.MaxAttempts)
+	}
 	fmt.Fprintf(os.Stderr, "Share the code/URL and the PIN over two different channels.\n")
 }
 
